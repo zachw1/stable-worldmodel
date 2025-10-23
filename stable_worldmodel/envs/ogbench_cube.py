@@ -26,7 +26,6 @@ Example:
             obs, reward, terminated, truncated, info = env.step(action)
             if info['success']:
                 break
-
 .. _OGBench:
    https://github.com/seohongpark/ogbench/
 """
@@ -39,52 +38,7 @@ from ogbench.manipspace.envs.manipspace_env import ManipSpaceEnv
 
 import stable_worldmodel as swm
 
-
-def perturb_camera_angle(xyaxis, deg_dif=[3, 3]):
-    """Perturb camera orientation by applying yaw and pitch rotations.
-
-    Applies random rotations to the camera's coordinate frame defined by its
-    x and y axes. The perturbation helps create visual variations during training
-    to improve policy robustness.
-
-    Args:
-        xyaxis (array-like): Six-element array representing the camera's coordinate
-            frame in MuJoCo format. First three elements are the x-axis direction,
-            last three elements are the y-axis direction.
-        deg_dif (list, optional): Two-element list specifying [yaw, pitch] rotation
-            angles in degrees. Defaults to [3, 3].
-
-    Returns:
-        tuple: Six-element tuple containing the perturbed camera axes in MuJoCo
-            format (xaxis_new, yaxis_new).
-
-    Note:
-        The z-axis is computed from the cross product of x and y axes and used
-        to construct proper rotation matrices.
-    """
-    xaxis = np.array(xyaxis[:3])
-    yaxis = np.array(xyaxis[3:])
-
-    # Compute z-axis
-    zaxis = np.cross(xaxis, yaxis)
-    zaxis /= np.linalg.norm(zaxis)
-
-    # random rotation
-    yaw = np.deg2rad(deg_dif[0])
-    pitch = np.deg2rad(deg_dif[1])
-
-    # rotation matrices
-    R_yaw = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
-    R_pitch = np.array([[1, 0, 0], [0, np.cos(pitch), -np.sin(pitch)], [0, np.sin(pitch), np.cos(pitch)]])
-
-    # Combine and rotate the basis
-    R = R_pitch @ R_yaw
-    xaxis_new = R @ xaxis
-    yaxis_new = R @ yaxis
-
-    xyaxes_new = tuple(np.concatenate([xaxis_new, yaxis_new]))  # mujoco format
-
-    return xyaxes_new
+from .utils import perturb_camera_angle
 
 
 class CubeEnv(ManipSpaceEnv):
@@ -132,7 +86,17 @@ class CubeEnv(ManipSpaceEnv):
         control, physics simulation, and base functionality.
     """
 
-    def __init__(self, env_type, ob_type="pixels", permute_blocks=True, multiview=False, *args, **kwargs):
+    def __init__(
+        self,
+        env_type="single",
+        ob_type="pixels",
+        permute_blocks=True,
+        multiview=False,
+        height=224,
+        width=224,
+        *args,
+        **kwargs,
+    ):
         """Initialize the CubeEnv with specified configuration.
 
         Sets up the manipulation environment with the specified number of cubes
@@ -179,11 +143,39 @@ class CubeEnv(ManipSpaceEnv):
         else:
             raise ValueError(f"Invalid env_type: {env_type}")
 
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, height=height, width=width, **kwargs)
 
         self._ob_type = ob_type
-        self._cube_colors = np.stack(list(self._colors.values()))[:, :3]
+
+        # Define constants.
+        self._cube_colors = np.array(
+            [
+                self._colors["red"],
+                self._colors["blue"],
+                self._colors["orange"],
+                self._colors["green"],
+                self._colors["purple"],
+                self._colors["yellow"],
+                self._colors["magenta"],
+                self._colors["gray"],
+            ]
+        )
+        self._cube_success_colors = np.array(
+            [
+                self._colors["lightred"],
+                self._colors["lightblue"],
+                self._colors["lightorange"],
+                self._colors["lightgreen"],
+                self._colors["lightpurple"],
+                self._colors["lightyellow"],
+                self._colors["lightmagenta"],
+                self._colors["white"],
+            ]
+        )
+
+        # Target info.
         self._target_task = "cube"
+        # The target cube position is stored in the mocap object.
         self._target_block = 0
 
         self.variation_space = swm.spaces.Dict(
@@ -196,7 +188,7 @@ class CubeEnv(ManipSpaceEnv):
                             high=1.0,
                             shape=(self._num_cubes, 3),
                             dtype=np.float64,
-                            init_value=self._cube_colors[: self._num_cubes].copy(),
+                            init_value=self._cube_colors[: self._num_cubes, :3].copy(),
                         ),
                         "size": swm.spaces.Box(
                             low=0.01,
@@ -708,7 +700,7 @@ class CubeEnv(ManipSpaceEnv):
         if self._reward_task_id == 0:
             self._reward_task_id = 2  # Default task.
 
-    def reset(self, options=None, *args, **kwargs):
+    def reset(self, seed=None, options=None, *args, **kwargs):
         """Reset the environment to an initial state.
 
         Resets the environment and optionally samples from the variation space to
@@ -741,6 +733,10 @@ class CubeEnv(ManipSpaceEnv):
 
                 obs, info = env.reset(options={'variation': ['cube.color', 'camera.angle_delta']})
         """
+
+        if hasattr(self, "variation_space"):
+            self.variation_space.seed(seed)
+
         options = options or {}
 
         self.variation_options = options.get("variation", {})
@@ -760,7 +756,7 @@ class CubeEnv(ManipSpaceEnv):
 
         assert self.variation_space.check(debug=True), "Variation values must be within variation space!"
 
-        return super().reset(options, *args, **kwargs)
+        return super().reset(seed=seed, options=options, *args, **kwargs)
 
     def add_objects(self, arena_mjcf):
         """Add cube objects and cameras to the MuJoCo scene.
@@ -1358,36 +1354,63 @@ class CubeEnv(ManipSpaceEnv):
         *args,
         **kwargs,
     ):
-        """Render the current scene from specified camera view(s).
+        """Render the current scene from a specified camera view.
 
-        Generates RGB image(s) of the current environment state from one or more
-        camera viewpoints. Automatically handles multiview rendering when configured.
+        Generates an RGB image of the current environment state from a single
+        camera viewpoint. This method renders from one camera at a time.
 
         Args:
-            camera (str or list, optional): Camera name(s) to render from. Can be
-                a single camera name string or list of camera names. If multiview
-                is enabled, defaults to ['front_pixels', 'side_pixels']. Otherwise
-                defaults to 'front_pixels'. Supports any camera defined in self.cameras.
+            camera (str, optional): Camera name to render from. Defaults to
+                'front_pixels'. Supports any camera defined in self.cameras
+                (e.g., 'front_pixels', 'side_pixels').
             *args: Additional positional arguments passed to parent render method.
             **kwargs: Additional keyword arguments passed to parent render method.
 
         Returns:
-            ndarray: Rendered image(s). If camera is a single string, returns array
-                with shape (H, W, C). If camera is a list, returns array with shape
-                (N, H, W, C) where N is the number of views, stacked along first axis.
+            ndarray: Rendered image with shape (H, W, C) where H is height,
+                W is width, and C is the number of color channels (typically 3 for RGB).
 
         Note:
-            The multiview stacking is useful for policies that benefit from multiple
-            viewpoints, such as those learning 3D spatial reasoning. The 'front_pixels'
-            camera provides an oblique view while 'side_pixels' shows a perpendicular view.
+            For rendering from multiple cameras simultaneously, use the
+            `render_multiview()` method instead.
         """
-        camera = "front_pixels" if not self._multiview else ["front_pixels", "side_pixels"]
-        if isinstance(camera, list | tuple):
-            imgs = []
-            for cam in camera:
-                img = super().render(camera=cam, *args, **kwargs)
-                imgs.append(img)
-            stacked_views = np.stack(imgs, axis=0)
-            return stacked_views
-        else:
-            return super().render(camera=camera, *args, **kwargs)
+        return super().render(camera=camera, *args, **kwargs)
+
+    def render_multiview(
+        self,
+        camera="front_pixels",
+        *args,
+        **kwargs,
+    ):
+        """Render the current scene from multiple camera views or a fallback single view.
+
+        When multiview mode is enabled (`_multiview=True`), renders the scene from
+        both 'front_pixels' and 'side_pixels' cameras and returns them as a
+        dictionary. When multiview is disabled, falls back to rendering from a
+        single camera.
+
+        Args:
+            camera (str, optional): Camera name to use for fallback rendering when
+                multiview is disabled. Defaults to 'front_pixels'. Ignored when
+                multiview is enabled.
+            *args: Additional positional arguments passed to the render method.
+            **kwargs: Additional keyword arguments passed to the render method.
+
+        Returns:
+            dict or ndarray: If multiview is enabled, returns a dictionary with camera
+                names as keys ('front_pixels', 'side_pixels') and rendered images as
+                values, where each image has shape (H, W, C). If multiview is disabled,
+                returns a single rendered image array with shape (H, W, C).
+
+        Note:
+            The multiview dictionary format is useful for policies that process
+            multiple viewpoints separately. The 'front_pixels' camera provides an
+            oblique view while 'side_pixels' shows a perpendicular side view.
+        """
+
+        if not self._multiview:
+            return self.render(camera=camera, *args, **kwargs)
+
+        cam_names = ["front_pixels", "side_pixels"]
+        multi_view = {cam: self.render(camera=cam, *args, **kwargs) for cam in cam_names}
+        return multi_view
