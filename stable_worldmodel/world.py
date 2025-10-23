@@ -307,7 +307,8 @@ class World:
         records_path = dataset_path  # / "records"
         num_chunks = episodes // 50
         records_path.mkdir(parents=True, exist_ok=True)
-        records_ds.save_to_disk(records_path, num_shards=num_chunks or 1)
+        # ZACH CHANGE:records_ds.save_to_disk(records_path, num_shards=num_chunks or 1)
+        records_ds.save_to_disk(str(records_path), num_shards=num_chunks or 1)
 
         print(f"Dataset saved to {dataset_path} with {episodes} episodes!")
 
@@ -340,8 +341,8 @@ class World:
             )
             for i in episode_idx
         ]
-
-        dataset = load_from_disk(dataset_path).with_format("numpy")
+        # ZACH CHANGE: dataset = load_from_disk(dataset_path).with_format("numpy")
+        dataset = load_from_disk(str(dataset_path)).with_format("numpy")
 
         for i, o in zip(episode_idx, out):
             episode = dataset.filter(lambda ex: ex["episode_idx"] == i, num_proc=num_proc)

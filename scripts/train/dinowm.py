@@ -4,13 +4,13 @@ import hydra
 import lightning as pl
 import stable_pretraining as spt
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from loguru import logger as logging
 from omegaconf import OmegaConf
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModel
+from transformers.models.dinov2.modeling_dinov2 import Dinov2Model
 
 import stable_worldmodel as swm
 
@@ -142,7 +142,7 @@ def get_world_model(cfg):
     """Build world model: frozen DINO encoder + trainable causal predictor."""
 
     # Load frozen DINO encoder
-    encoder = AutoModel.from_pretrained("facebook/dinov2-small")
+    encoder = Dinov2Model.from_pretrained("facebook/dinov2-small")
     embedding_dim = encoder.config.hidden_size
 
     num_patches = (cfg.image_size // cfg.patch_size) ** 2
@@ -225,19 +225,20 @@ def run(cfg):
     world_model = get_world_model(cfg)
 
     cache_dir = swm.data.get_cache_dir()
-    checkpoint_callback = ModelCheckpoint(dirpath=cache_dir, filename=f"{cfg.output_model_name}_weights")
-
+    
     trainer = pl.Trainer(
         max_epochs=cfg.epochs,
-        callbacks=[checkpoint_callback],
+        callbacks=[],
         num_sanity_val_steps=1,
         logger=wandb_logger,
         log_every_n_steps=50,
         precision="16-mixed",
-        enable_checkpointing=True,
+        enable_checkpointing=False,
     )
 
-    manager = spt.Manager(trainer=trainer, module=world_model, data=data)
+    # Provide checkpoint path to avoid Manager errors
+    ckpt_path = Path(cache_dir) / f"{cfg.output_model_name}_weights.ckpt"
+    manager = spt.Manager(trainer=trainer, module=world_model, data=data, ckpt_path=ckpt_path)
     manager()
 
     if trainer.is_global_zero and hasattr(cfg, "dump_object") and cfg.dump_object:

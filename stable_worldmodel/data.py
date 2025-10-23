@@ -26,7 +26,12 @@ class StepsDataset(spt.data.HFDataset):
         **kwargs,
     ):
         data_dir = Path(kwargs.get("cache_dir", swm.data.get_cache_dir()), path)
-        super().__init__(str(data_dir), *args, **kwargs)
+        
+        # ZACH CHANGE: data_dir = Path(kwargs.get("cache_dir", swm.data.get_cache_dir()), path)
+        # Load dataset using load_from_disk since it was saved with save_to_disk
+        # Skip the parent's __init__ and set dataset directly
+        self.dataset = load_from_disk(str(data_dir))
+        self.transform = kwargs.get("transform", None)
 
         self.data_dir = data_dir
         self.num_steps = num_steps
