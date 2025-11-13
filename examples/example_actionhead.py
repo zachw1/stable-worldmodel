@@ -124,24 +124,24 @@ def attach_goal(steps: StepsDataset):
 
 
 def get_loaders(train_data, val_data, batch_size, device, num_workers):
-# optionally pin_memory on CUDA, not Mac
-train_loader = DataLoader(
-    train_data,
-        batch_size=batch_size,
-    shuffle=True,
-        num_workers=num_workers,
-        persistent_workers=True,
-        pin_memory=(device.type=='cuda')
-)
-
-val_loader = DataLoader(
-    val_data,
-        batch_size=batch_size,
-    shuffle=False,
-        num_workers=num_workers,
-        persistent_workers=True,
-        pin_memory=(device.type=='cuda')
+    # optionally pin_memory on CUDA, not Mac
+    train_loader = DataLoader(
+        train_data,
+            batch_size=batch_size,
+        shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=True,
+            pin_memory=(device.type=='cuda')
     )
+
+    val_loader = DataLoader(
+        val_data,
+            batch_size=batch_size,
+        shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=True,
+            pin_memory=(device.type=='cuda')
+        )
     return train_loader, val_loader
 
 # load model checkpoint from cache_dir in inference mode
