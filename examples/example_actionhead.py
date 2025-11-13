@@ -37,6 +37,17 @@ TRAIN_DIR = "pusht_expert_dataset_train"
 VAL_DIR = "pusht_expert_dataset_val"
 CHECKPOINT_NAME = "dinowm_pusht_object.ckpt"
 
+# MPC recording parameters
+MPC_EPISODES = 10
+MPC_SEED = 2347
+MPC_DATASET_NAME = "example-pusht-mpc"
+MPC_HORIZON = 5
+MPC_RECEDING_HORIZON = 5
+MPC_ACTION_BLOCK = 5
+MPC_NUM_SAMPLES = 300
+MPC_N_STEPS = 30
+MPC_TOPK = 30
+
 
 # Simple MLP
 class MLP(nn.Module):
@@ -113,20 +124,20 @@ def attach_goal(steps: StepsDataset):
 
 
 def get_loaders(train_data, val_data, batch_size, device, num_workers):
-    # optionally pin_memory on CUDA, not Mac
-    train_loader = DataLoader(
-        train_data,
+# optionally pin_memory on CUDA, not Mac
+train_loader = DataLoader(
+    train_data,
         batch_size=batch_size,
-        shuffle=True,
+    shuffle=True,
         num_workers=num_workers,
         persistent_workers=True,
         pin_memory=(device.type=='cuda')
-    )
+)
 
-    val_loader = DataLoader(
-        val_data,
+val_loader = DataLoader(
+    val_data,
         batch_size=batch_size,
-        shuffle=False,
+    shuffle=False,
         num_workers=num_workers,
         persistent_workers=True,
         pin_memory=(device.type=='cuda')
@@ -199,6 +210,138 @@ def to_feature(z_pixels, z_proprio, z_actions):
     return z
 
 
+def record_mpc_rollouts(device=None, checkpoint_name=None, dataset_name=None, episodes=None, seed=None):
+    """
+    Args:
+        device: torch device (auto-detected if None)
+        checkpoint_name: Name of DINO-WM checkpoint (uses CHECKPOINT_NAME if None)
+        dataset_name: Name for output dataset (uses MPC_DATASET_NAME if None)
+        episodes: Number of episodes to record (uses MPC_EPISODES if None)
+        seed: Random seed (uses MPC_SEED if None)
+    """
+    
+    # Use defaults if not provided
+    if device is None:
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+    
+    checkpoint_name = checkpoint_name or CHECKPOINT_NAME
+    dataset_name = dataset_name or MPC_DATASET_NAME
+    episodes = episodes or MPC_EPISODES
+    seed = seed or MPC_SEED
+    
+    print(f"Device: {device}")
+    print(f"Checkpoint: {checkpoint_name}")
+    print(f"Output dataset: {dataset_name}")
+    print(f"Episodes: {episodes}, Seed: {seed}")
+    
+    # Create world
+    world = swm.World(
+        "swm/PushT-v1",
+        num_envs=2,
+        image_shape=(224, 224),
+        max_episode_steps=25,
+        render_mode="rgb_array",
+    )
+    
+    # Load random dataset for preprocessors (or use existing expert dataset)
+    import datasets
+    from sklearn import preprocessing
+    from torchvision.transforms import v2 as transforms
+    
+    cache_dir = swm.data.get_cache_dir()
+    
+    try:
+        random_ds = datasets.load_from_disk(str(cache_dir / "example-pusht"))
+        print("Loaded random dataset for preprocessors")
+    except:
+        # Fallback to expert dataset if random doesn't exist
+        try:
+            random_ds = datasets.load_from_disk(str(cache_dir / TRAIN_DIR))
+            print("using expert dataset for preprocessors")
+        except:
+            raise FileNotFoundError(
+                "Could not find dataset for fitting preprocessors. "
+                "Need either 'example-pusht' or expert dataset."
+            )
+    
+    # Fit preprocessors
+    print("Fitting preprocessors...")
+    action_process = preprocessing.StandardScaler()
+    action_process.fit(random_ds["action"][:])
+    
+    proprio_process = preprocessing.StandardScaler()
+    proprio_process.fit(random_ds["proprio"][:])
+    
+    process = {
+        "action": action_process,
+        "proprio": proprio_process,
+        "goal_proprio": proprio_process,
+    }
+    print("Fitted preprocessors")
+    
+    # Setup transforms
+    def img_transform():
+        return transforms.Compose([
+            transforms.Resize(size=224),
+            transforms.CenterCrop(size=224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+    
+    transform = {
+        "pixels": img_transform(),
+        "goal": img_transform(),
+    }
+    
+    # Load DINO-WM and create MPC policy
+    print(f"\nLoading DINO-WM checkpoint: {checkpoint_name}...")
+    model = swm.policy.AutoCostModel(checkpoint_name.replace("_object.ckpt", "")).to(device)
+    
+    print("Creating MPC policy...")
+    config = swm.PlanConfig(
+        horizon=MPC_HORIZON,
+        receding_horizon=MPC_RECEDING_HORIZON,
+        action_block=MPC_ACTION_BLOCK
+    )
+    
+    solver = swm.solver.CEMSolver(
+        model,
+        num_samples=MPC_NUM_SAMPLES,
+        var_scale=1.0,
+        n_steps=MPC_N_STEPS,
+        topk=MPC_TOPK,
+        device=str(device)
+    )
+    
+    policy = swm.policy.WorldModelPolicy(
+        solver=solver,
+        config=config,
+        process=process,
+        transform=transform
+    )
+    print(f"  Horizon: {MPC_HORIZON}, Receding: {MPC_RECEDING_HORIZON}")
+    print(f"  Samples: {MPC_NUM_SAMPLES}, Steps: {MPC_N_STEPS}, TopK: {MPC_TOPK}")
+    
+    # Record dataset
+    print(f"\nRecording {episodes} episodes with MPC.")
+    
+    world.set_policy(policy)
+    world.record_dataset(
+        dataset_name,
+        episodes=episodes,
+        seed=seed,
+        options=None,
+    )
+    
+    print(f"\n✓ Recorded MPC dataset to: {cache_dir / dataset_name}")
+    print("="*70)
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
@@ -258,8 +401,8 @@ def run():
             f"ETA = {eta / 60.0:.1f} min"
         )
 
-    for epoch in range(1, EPOCHS + 1):
-        action_head.train()
+for epoch in range(1, EPOCHS + 1):
+    action_head.train()
 
         t0 = time.perf_counter()
         n = 0
@@ -273,15 +416,15 @@ def run():
 
             pred = action_head(z)
 
-            loss = F.mse_loss(pred, action)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        loss = F.mse_loss(pred, action)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
             n += BATCH_SIZE
             if i % 100 == 0:
                 report_stats()
-        
+    
         # eval
         action_head.eval()
         val_loss = 0
@@ -297,5 +440,15 @@ def run():
         print(f'epoch {epoch}: RMSE: {val_rmse:.6f}')
 
 if __name__ == "__main__":
-    run()
+    import sys
+    
+    # check if user wants to record MPC rollouts
+    if len(sys.argv) > 1 and sys.argv[1] == "record":
+        print("="*70)
+        print("MPC Rollout Recording Mode")
+        print("="*70)
+        record_mpc_rollouts()
+    else:
+        # default
+        run()
 
