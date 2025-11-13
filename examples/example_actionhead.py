@@ -401,8 +401,8 @@ def run():
             f"ETA = {eta / 60.0:.1f} min"
         )
 
-for epoch in range(1, EPOCHS + 1):
-    action_head.train()
+    for epoch in range(1, EPOCHS + 1):
+        action_head.train()
 
         t0 = time.perf_counter()
         n = 0
@@ -416,10 +416,10 @@ for epoch in range(1, EPOCHS + 1):
 
             pred = action_head(z)
 
-        loss = F.mse_loss(pred, action)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            loss = F.mse_loss(pred, action)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
             n += BATCH_SIZE
             if i % 100 == 0:
