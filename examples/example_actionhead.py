@@ -3,21 +3,20 @@ from datasets import Dataset
 from pathlib import Path
 
 import stable_worldmodel as swm
-from stable_worldmodel.data import StepsDataset, dataset_info
-from stable_worldmodel.policy import AutoCostModel
+from stable_worldmodel.data import StepsDataset
 from stable_worldmodel.wm.dinowm import DINOWM
 
 import stable_pretraining as spt
+from PIL import Image
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-import math, time, contextlib
+import math, time, contextlib, functools
 
 # TODO: add goals + better evals
-
 
 # ============================================================================
 # Parameters
@@ -59,10 +58,9 @@ class MLP(nn.Module):
 # ============================================================================
 
 # Transform function: normalize + reshape
-def step_transform(num_steps):
+def make_transform(keys):
     transforms = []
-    for t in range(num_steps):
-        key = f"pixels.{t}"
+    for key in keys:
         transforms.append(
             spt.data.transforms.Compose(
                 spt.data.transforms.ToImage(
@@ -78,39 +76,52 @@ def step_transform(num_steps):
     return spt.data.transforms.Compose(*transforms)
 
 # Preprocessing function
-def load_dataset(dir, num_steps=1, frameskip=5):
-    transform = step_transform(num_steps)
+def load_dataset(dir, num_steps=1, frameskip=FRAMESKIP):
+    transform = make_transform([f'pixels.{i}' for i in range(num_steps)])
 
     dataset = StepsDataset(dir, num_steps=num_steps, transform=transform, frameskip=frameskip) # frameskip?
+
     # hacky
     dataset.data_dir = dataset.data_dir.parent
-    attach_goal(dataset)
 
-    return dataset
+    # add goal column if not there
+    goals = cache_goals(dataset)
 
-def attach_goal(steps: StepsDataset):
-    data = steps.dataset
-    if "goal" in data.column_names:
-        return
-    data = data.with_format("python")
+    return dataset, goals
 
-    goal_pixels = [None] * len(data)
-    goal_proprio = [None] * len(data)
+def cache_goals(steps: StepsDataset):
+    data = steps.dataset.with_format("python")
+    goals = {} # {episode -> {goal pixel, goal_proprio}}
+    transform = make_transform(['goal_pixels'])
 
-    for ep, idx_slice in steps.episode_slices.items():
-        final_idx = int(idx_slice[-1])
-        goal_px = data["pixels"][final_idx]
-        goal_pr = data["proprio"][final_idx]
-        for i in idx_slice:
-            goal_pixels[int(i)] = goal_px
-            goal_proprio[int(i)] = goal_pr
+    for ep, indices in steps.episode_slices.items():
+        goal_idx = indices[-1]
 
-    data = data.add_column("goal", goal_pixels)
-    data = data.add_column("goal_proprio", goal_proprio)
-    # print('done!')
+        # transform img here
+        with Image.open(steps.data_dir / data["pixels"][goal_idx]) as img:
+            info = {'goal_pixels': img}
+            transform(info)
+            goal_pixels = info['goal_pixels']
+        
+        goals[ep] = {"goal_pixels": goal_pixels,
+                     "goal_proprio": torch.as_tensor(data["proprio"][goal_idx], dtype = torch.float32).clone(),
+                     }
+
     steps.dataset = data.with_format("torch")
+    return goals
 
+def attach_goals(batch, goals):
+    goal_pixels = []
+    goal_proprios = []
 
+    for eps in batch["episode_idx"].tolist():
+        goal = goals[eps[0]]
+        goal_pixels.append(goal["goal_pixels"])
+        goal_proprios.append(goal["goal_proprio"])
+
+    batch["goal_pixels"] = torch.stack(goal_pixels).unsqueeze(1)
+    batch["goal_proprio"] = torch.stack(goal_proprios).unsqueeze(1)
+    return batch
 
 def get_loaders(train_data, val_data, batch_size, device, num_workers):
     # optionally pin_memory on CUDA, not Mac
@@ -147,24 +158,25 @@ def load_checkpoint(checkpoint_name, device):
 # Encoder func: call dinowm encoders
 @torch.inference_mode()
 def encode(batch, dinowm, device, use_actions=False):
-    if device.type in ("cuda", "mps"):
-        context = torch.autocast(device_type=device.type, dtype=torch.float16) # float32?
-    else:
-        context = contextlib.nullcontext()
-    
-    # no pad, we use frameskip=5
-    # actions = batch["action"][::-1]
-    # print(actions.shape)
-    # padded_actions = pad_actions(actions)
-    # repeated_actions = repeat_actions(actions)
-    # print(repeated_actions.shape)
+    # this is hacky
+    pixels = torch.cat((batch["pixels"],
+                        batch['goal_pixels']), dim=1).to(device, non_blocking=True)
+    proprio = torch.cat((batch["proprio"],
+                         batch["goal_proprio"]), dim=1).to(device, non_blocking=True)
+    actions = (
+        torch.cat(
+            (batch["action"], torch.zeros_like(batch['action'][:, :1])),
+            dim=1,
+        ).to(device, non_blocking=True) if use_actions else None
+    ) # pad with a single step of 0s
 
     data = {
-        "pixels": batch["pixels"].to(device, non_blocking=True),
-        "proprio": batch["proprio"].to(device, non_blocking=True),
-        "action": (batch["action"].to(device, non_blocking=True) if use_actions else None),
+        "pixels": pixels,
+        "proprio": proprio,
+        "action": actions,
     }
 
+    context = torch.autocast(device_type=device.type, dtype=torch.float16) if device.type in ("cuda", "mps") else contextlib.nullcontext()
     with context:
         out = dinowm.encode(
             data,
@@ -174,25 +186,31 @@ def encode(batch, dinowm, device, use_actions=False):
             action_key=("action" if use_actions else None),
         )
 
-    z_pixels = out["pixels_embed"].mean(dim=2).float() # B x T x d_pixels (pooled by patch)
-    z_proprio = out["proprio_embed"].float() # B x T x d_proprio
-    z_actions = None
-    if use_actions:
-        z_actions = out["action_embed"][:,:-1].float() # B x (T - 1) * d_actions_effective := (d_actions * frame_skip)
-        
-    return z_pixels, z_proprio, z_actions
+    # attach attention pooler here
+    pix_out = out["pixels_embed"].mean(dim=2).float()
+    prp_out = out["proprio_embed"].float()
 
-def to_feature(z_pixels, z_proprio, z_actions):
-    parts = [z_pixels[:,:-1], z_proprio[:,:-1]]
-    if z_actions is not None:
-        parts.append(z_actions)
+    # detach goal pixels + proprio
+    z_pix, z_gpix = pix_out[:,:-1], pix_out[:,-1] # B x T x d_pixels (pooled by patch), B x d_pixels
+    z_prp, z_gprp = prp_out[:,:-1], prp_out[:,-1] # B x T x d_proprio, B x d_proprio
+    
+    z_act = None
+    if use_actions:
+        z_act = out["action_embed"][:,:-2].float() # B x (T - 1) * d_actions_effective := (d_actions * frame_skip)
+    
+    return z_pix, z_prp, z_act, z_gpix, z_gprp
+
+def to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp):
+    parts = [z_pix[:,:-1], z_prp[:,:-1]]
+    if z_act is not None:
+        parts.append(z_act)
 
     # history latents (block of S actions + state := (pixel + proprio embeddings))
     z_hist = torch.cat(parts, dim=2) # B x (T-1) x d_embed := [d_pixels + d_proprio (+ d_actions_effective)]
     z_hist = torch.flatten(z_hist, start_dim=1, end_dim=2) # B x ((T-1) * d_embed)
     
-    # current latents (just pixel + proprio embeedings)
-    z_cur = torch.cat((z_pixels[:,-1], z_proprio[:,-1]), dim=1) # B x 1 x (d_pixels + d_proprio)
+    # current + goal latents (just pixel + proprio embeedings)
+    z_cur = torch.cat((z_pix[:,-1], z_prp[:,-1], z_gpix, z_gprp), dim=1) # B x 2 * (d_pixels + d_proprio)
 
     # concat
     z = torch.cat((z_hist, z_cur), dim=1)
@@ -221,12 +239,12 @@ def run():
     print("device:", device)
 
     # load datasets
-    train_data, val_data = load_dataset(TRAIN_DIR, NUM_STEPS), load_dataset(VAL_DIR, NUM_STEPS)
+    train_data, train_goals = load_dataset(TRAIN_DIR, NUM_STEPS)
+    val_data, val_goals = load_dataset(VAL_DIR, NUM_STEPS)
     print(f"Loaded datasets: train size={len(train_data)}, val size={len(val_data)}")
 
     # build loaders
     train_loader, val_loader = get_loaders(train_data, val_data, BATCH_SIZE, device, NUM_WORKERS)
-
 
     # load DINO-WM
     dinowm = load_checkpoint(CHECKPOINT_NAME, device)
@@ -237,7 +255,8 @@ def run():
     d_pixel = dinowm.backbone.config.hidden_size
     d_proprio = dinowm.proprio_encoder.emb_dim
     d_action = dinowm.action_encoder.emb_dim
-    LATENT_DIM = (d_pixel + d_proprio) * NUM_STEPS + (d_action if USE_ACTIONS else 0) * (NUM_STEPS - 1)
+    
+    LATENT_DIM = (d_pixel + d_proprio) * (NUM_STEPS + 1) + (d_action if USE_ACTIONS else 0) * (NUM_STEPS - 1)
     ACTION_DIM = 2 # predict actual action, not latent
     print(f'latent_dim={LATENT_DIM}, action_dim={ACTION_DIM}')
 
@@ -252,7 +271,7 @@ def run():
         bps = n / max(1e-9, elapsed)
         eta = (num_batches - i) / max(1e-9, sps)
         print(
-            f"Epoch: {epoch} Step: {i}/{len(train_loader)} "
+            f"Epoch {epoch}: step {i}/{len(train_loader)} "
             f"Loss = {loss.item():.4f} "
             f"steps / sec = {sps:.1f}, batches / sec = {bps:.1f} "
             f"ETA = {eta / 60.0:.1f} min"
@@ -266,9 +285,9 @@ def run():
         num_batches = len(train_loader) # could be outside loop
 
         for i, batch in enumerate(train_loader):
-
-            z_pix, z_prp, z_act = encode(batch, dinowm, device, USE_ACTIONS)
-            z = to_feature(z_pix, z_prp, z_act)
+            attach_goals(batch, train_goals)
+            z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device, USE_ACTIONS)
+            z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
             action = batch['action'][:,-1,:2].to(device) # first action from the last (current) step
 
             pred = action_head(z)
@@ -287,15 +306,17 @@ def run():
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                z_pix, z_prp, z_act = encode(batch, USE_ACTIONS)
-                z = to_feature(z_pix, z_prp, z_act)
+                attach_goals(batch, val_goals)
+                z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device, USE_ACTIONS)
+                z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
                 action = batch['action'][:,-1,:2].to(device)
 
-                z = action_head(z)
-                val_loss += F.mse_loss(pred, action)
+                pred = action_head(z)
+                loss = F.mse_loss(pred, action)
+                val_loss += loss.item() * BATCH_SIZE
+
         val_rmse = math.sqrt(val_loss / len(val_data))
         print(f'epoch {epoch}: RMSE: {val_rmse:.6f}')
 
 if __name__ == "__main__":
     run()
-
