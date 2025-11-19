@@ -16,26 +16,40 @@ import torch.nn.functional as F
 
 import math, time, contextlib, functools
 
-# TODO: add goals + better evals
+# TODO:
+#   - Lightning/spt callbacks?
+#   - split into cached and uncached
+#   - add attentive pooler
+
 
 # ============================================================================
 # Parameters
 # ============================================================================
 
-NUM_WORKERS = 6
-NUM_STEPS = 2 # T
-BATCH_SIZE = 256 # B
-FRAMESKIP = 5 # S
+# DATA PARAMS:
+NUM_STEPS = 2       # T
+FRAMESKIP = 5       # FIXED
+
+# LOAD PARAMS:
+BATCH_SIZE = 1024   # B
+NUM_WORKERS = 16
+PREFETCH_FACTOR = 4
+
+# TRAINING PARAMS:
 EPOCHS = 25
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
 USE_ACTIONS = True
 
-# file paths
+# PATHS:
 TRAIN_DIR = "pusht_expert_dataset_train"
 VAL_DIR = "pusht_expert_dataset_val"
 CHECKPOINT_NAME = "dinowm_pusht_object.ckpt"
 
+
+# ============================================================================
+# Model to train
+# ============================================================================
 
 # Simple MLP
 class MLP(nn.Module):
@@ -76,36 +90,40 @@ def make_transform(keys):
     return spt.data.transforms.Compose(*transforms)
 
 # Preprocessing function
-def load_dataset(dir, num_steps=1, frameskip=FRAMESKIP):
+def load_dataset(dir, num_steps=NUM_STEPS, frameskip=FRAMESKIP):
     transform = make_transform([f'pixels.{i}' for i in range(num_steps)])
-
-    dataset = StepsDataset(dir, num_steps=num_steps, transform=transform, frameskip=frameskip) # frameskip?
-
-    # hacky
+    dataset = StepsDataset(dir, num_steps=num_steps, transform=transform, frameskip=frameskip)
+    # cache_dir=swm.data.get_cache_dir()?
     dataset.data_dir = dataset.data_dir.parent
 
     # add goal column if not there
     goals = cache_goals(dataset)
 
-    return dataset, goals
+    return dataset, goals 
 
 def cache_goals(steps: StepsDataset):
     data = steps.dataset.with_format("python")
-    goals = {} # {episode -> {goal pixel, goal_proprio}}
+    columns = set(data.column_names)
+
     transform = make_transform(['goal_pixels'])
+    goals = {}  # {episode -> {goal pixel, goal_proprio}}
 
     for ep, indices in steps.episode_slices.items():
-        goal_idx = indices[-1]
+        end = indices[-1]
+        goal_img_path = steps.data_dir / data["goal" if "goal" in columns else "pixels"][end]
 
-        # transform img here
-        with Image.open(steps.data_dir / data["pixels"][goal_idx]) as img:
+        with Image.open(goal_img_path) as img:
             info = {'goal_pixels': img}
             transform(info)
             goal_pixels = info['goal_pixels']
-        
-        goals[ep] = {"goal_pixels": goal_pixels,
-                     "goal_proprio": torch.as_tensor(data["proprio"][goal_idx], dtype = torch.float32).clone(),
-                     }
+
+        goal_proprio = data["goal_proprio" if "goal_proprio" in columns else "proprio"][end]
+        goal_proprio = torch.as_tensor(goal_proprio, dtype=torch.float32).clone()
+
+        goals[ep] = {
+            "goal_pixels": goal_pixels,
+            "goal_proprio": goal_proprio,
+        }
 
     steps.dataset = data.with_format("torch")
     return goals
@@ -123,32 +141,29 @@ def attach_goals(batch, goals):
     batch["goal_proprio"] = torch.stack(goal_proprios).unsqueeze(1)
     return batch
 
-def get_loaders(train_data, val_data, batch_size, device, num_workers):
-    # optionally pin_memory on CUDA, not Mac
-    train_loader = DataLoader(
-        train_data,
+def get_loader(data,
+               device,
+               batch_size=BATCH_SIZE,
+               num_workers=NUM_WORKERS,
+               prefetch_factor=PREFETCH_FACTOR,
+               shuffle=True):
+    
+    loader = DataLoader(
+        data,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
         persistent_workers=True,
+        prefetch_factor=prefetch_factor,
         pin_memory=(device.type=='cuda')
     )
+    return loader
 
-    val_loader = DataLoader(
-        val_data,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        persistent_workers=True,
-        pin_memory=(device.type=='cuda')
-    )
-    return train_loader, val_loader
-
-# load model checkpoint from cache_dir in inference mode
+# Load model checkpoint from cache_dir in inference mode
 def load_checkpoint(checkpoint_name, device):
     cache_dir = swm.data.get_cache_dir()
     checkpoint_path = cache_dir / checkpoint_name
-    model = torch.load(checkpoint_path, map_location=device, weights_only=False) # weights_only false
+    model = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model = model.to(device).eval()
 
     for param in model.parameters():
@@ -157,7 +172,7 @@ def load_checkpoint(checkpoint_name, device):
 
 # Encoder func: call dinowm encoders
 @torch.inference_mode()
-def encode(batch, dinowm, device, use_actions=False):
+def encode(batch, dinowm, device, use_actions=USE_ACTIONS):
     # this is hacky
     pixels = torch.cat((batch["pixels"],
                         batch['goal_pixels']), dim=1).to(device, non_blocking=True)
@@ -239,12 +254,12 @@ def run():
     print("device:", device)
 
     # load datasets
-    train_data, train_goals = load_dataset(TRAIN_DIR, NUM_STEPS)
-    val_data, val_goals = load_dataset(VAL_DIR, NUM_STEPS)
-    print(f"Loaded datasets: train size={len(train_data)}, val size={len(val_data)}")
+    train_data, train_goals = load_dataset(TRAIN_DIR)
+    val_data, val_goals = load_dataset(VAL_DIR)
+    print(f"Loaded datasets from {TRAIN_DIR}, {VAL_DIR}:\ntrain size={len(train_data)}, val size={len(val_data)}")
 
     # build loaders
-    train_loader, val_loader = get_loaders(train_data, val_data, BATCH_SIZE, device, NUM_WORKERS)
+    train_loader, val_loader = get_loader(train_data, device), get_loader(val_data, device, shuffle=False)
 
     # load DINO-WM
     dinowm = load_checkpoint(CHECKPOINT_NAME, device)
@@ -257,10 +272,10 @@ def run():
     d_action = dinowm.action_encoder.emb_dim
     
     LATENT_DIM = (d_pixel + d_proprio) * (NUM_STEPS + 1) + (d_action if USE_ACTIONS else 0) * (NUM_STEPS - 1)
-    ACTION_DIM = 2 # predict actual action, not latent
+    ACTION_DIM = 2
     print(f'latent_dim={LATENT_DIM}, action_dim={ACTION_DIM}')
 
-    # train action head
+    # setup training loop
     action_head = MLP(LATENT_DIM, ACTION_DIM).to(device)
     optimizer = torch.optim.AdamW(action_head.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
@@ -277,16 +292,16 @@ def run():
             f"ETA = {eta / 60.0:.1f} min"
         )
 
+    num_batches = len(train_loader)
     for epoch in range(1, EPOCHS + 1):
         action_head.train()
-
         t0 = time.perf_counter()
         n = 0
-        num_batches = len(train_loader) # could be outside loop
 
+        # train
         for i, batch in enumerate(train_loader):
             attach_goals(batch, train_goals)
-            z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device, USE_ACTIONS)
+            z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
             z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
             action = batch['action'][:,-1,:2].to(device) # first action from the last (current) step
 
@@ -297,7 +312,7 @@ def run():
             loss.backward()
             optimizer.step()
 
-            n += BATCH_SIZE
+            n += BATCH_SIZE # partial batches this breaks but whatever
             if i % 100 == 0:
                 report_stats()
         
@@ -307,13 +322,14 @@ def run():
         with torch.no_grad():
             for batch in val_loader:
                 attach_goals(batch, val_goals)
-                z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device, USE_ACTIONS)
+                z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
                 z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
                 action = batch['action'][:,-1,:2].to(device)
 
                 pred = action_head(z)
                 loss = F.mse_loss(pred, action)
-                val_loss += loss.item() * BATCH_SIZE
+                batch_size = batch['action'].shape[0]
+                val_loss += loss.item() * batch_size
 
         val_rmse = math.sqrt(val_loss / len(val_data))
         print(f'epoch {epoch}: RMSE: {val_rmse:.6f}')
