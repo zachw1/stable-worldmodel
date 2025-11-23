@@ -430,11 +430,11 @@ def run():
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                z_pix, z_prp, z_act = encode(batch, USE_ACTIONS)
+                z_pix, z_prp, z_act = encode(batch, dinowm, device, USE_ACTIONS)
                 z = to_feature(z_pix, z_prp, z_act)
                 action = batch['action'][:,-1,:2].to(device)
 
-                z = action_head(z)
+                pred = action_head(z)
                 val_loss += F.mse_loss(pred, action)
         val_rmse = math.sqrt(val_loss / len(val_data))
         print(f'epoch {epoch}: RMSE: {val_rmse:.6f}')
