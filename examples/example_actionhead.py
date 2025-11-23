@@ -33,8 +33,8 @@ WEIGHT_DECAY = 1e-4
 USE_ACTIONS = True
 
 # file paths
-TRAIN_DIR = "pusht_expert_dataset_train"
-VAL_DIR = "pusht_expert_dataset_val"
+TRAIN_DIR = "example-pusht"  # Using example dataset (will be split)
+VAL_DIR = "example-pusht"  # Using example dataset (will be split)
 CHECKPOINT_NAME = "dinowm_pusht_object.ckpt"
 
 # MPC recording parameters
