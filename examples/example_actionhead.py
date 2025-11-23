@@ -44,9 +44,9 @@ MPC_DATASET_NAME = "example-pusht-mpc"
 MPC_HORIZON = 5
 MPC_RECEDING_HORIZON = 5
 MPC_ACTION_BLOCK = 5
-MPC_NUM_SAMPLES = 300
-MPC_N_STEPS = 30
-MPC_TOPK = 30
+MPC_NUM_SAMPLES = 100  # Reduced from 300 for GPU memory
+MPC_N_STEPS = 20       # Reduced from 30 for GPU memory
+MPC_TOPK = 15          # Reduced from 30 for GPU memory
 
 
 # Simple MLP
@@ -242,7 +242,7 @@ def record_mpc_rollouts(device=None, checkpoint_name=None, dataset_name=None, ep
     # Create world
     world = swm.World(
         "swm/PushT-v1",
-        num_envs=2,
+        num_envs=1,  # Reduced from 2 to save GPU memory
         image_shape=(224, 224),
         max_episode_steps=25,
         render_mode="rgb_array",
