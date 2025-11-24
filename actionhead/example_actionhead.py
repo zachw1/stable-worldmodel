@@ -83,16 +83,14 @@ def make_transform(keys):
                     source=key,
                     target=key,
                 ),
-                spt.data.transforms.Resize(224, source=key, target=key),
-                spt.data.transforms.CenterCrop(224, source=key, target=key),
             )
         )
     return spt.data.transforms.Compose(*transforms)
 
 # Preprocessing function
-def load_dataset(dir, num_steps=NUM_STEPS, frameskip=FRAMESKIP):
+def load_dataset(path, num_steps=NUM_STEPS, frameskip=FRAMESKIP):
     transform = make_transform([f'pixels.{i}' for i in range(num_steps)])
-    dataset = StepsDataset(dir, num_steps=num_steps, transform=transform, frameskip=frameskip)
+    dataset = StepsDataset(path, num_steps=num_steps, transform=transform, frameskip=frameskip)
     # cache_dir=swm.data.get_cache_dir()?
     dataset.data_dir = dataset.data_dir.parent
 
