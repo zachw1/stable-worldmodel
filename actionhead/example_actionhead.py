@@ -20,8 +20,11 @@ import wandb
 
 # TODO:
 #   - Lightning/spt callbacks?
-#   - split into cached and uncached
+#   - move encode logic into model
+#   - better OOP
+#   - validate wandb + checkpoints
 #   - add attentive pooler
+#   X split into cached and uncached
 
 
 # ============================================================================
@@ -47,6 +50,7 @@ USE_ACTIONS = True
 TRAIN_DIR = "/dev/shm/data/pusht_expert_dataset_train"
 VAL_DIR = "/dev/shm/data/pusht_expert_dataset_val"
 CHECKPOINT_NAME = "dinowm_pusht_object.ckpt"
+OUTPUT_DIR = "checkpoints"
 
 
 # ============================================================================
@@ -161,7 +165,7 @@ def cache_goals(steps: StepsDataset):
         "proprio": goal_proprio_tensor
     }
 
-def attach_goals(batch, goals, num_steps):
+def attach_goals(batch, goals):
     """Vectorized version of old attach_goals"""
     # index into goal tensors
     ep_indices = batch["episode_idx"][:, 0].long()
@@ -194,7 +198,6 @@ def load_checkpoint(checkpoint_name, device):
     print(f"Loaded DINO-WM from checkpoint: '{CHECKPOINT_NAME}'")
     return dinowm
 
-# Encoder func: call dinowm encoders
 @torch.inference_mode()
 def encode(batch, dinowm, device, use_actions=USE_ACTIONS):
     '''Encode to latents via DINO-WM'''
@@ -253,6 +256,87 @@ def to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp):
     z = torch.cat((z_hist, z_cur), dim=1)
     return z
 
+# ============================================================================
+# Loops
+# ============================================================================
+
+def train_epoch(action_head, device, dinowm, loader, goals, optimizer, epoch):
+    '''Train for one epoch'''
+    action_head.train()
+    t0 = t_prev = time.perf_counter()
+    num_batches = len(loader)
+
+    for i, batch in enumerate(loader):
+        # move CPU -> GPU
+        for k, v in batch.items():
+            if torch.is_tensor(v):
+                batch[k] = v.to(device, non_blocking=True)
+        
+        # attach goals
+        attach_goals(batch, goals)
+
+        # encode to feature
+        z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
+        z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
+        action = batch['action'][:,-1,:2] # first action from the last (current) step
+
+        pred = action_head(z)
+
+        loss = F.mse_loss(pred, action)
+        optimizer.zero_grad(set_to_none=True)   # optimization
+        loss.backward()
+        optimizer.step()
+
+        # logging
+        if i % 50 == 0:
+            if device.type == "cuda": torch.cuda.synchronize()
+            t = time.perf_counter()
+
+            bps_cum = 50 * (i + 1) / (t - t0)
+            bps_cur = 50 / (t - t_prev)
+            ips_cum = bps_cum * BATCH_SIZE
+            ips_cur = bps_cur * BATCH_SIZE
+            t_prev = t
+            
+            eta = (num_batches - (i + 1)) / (bps_cum * 60.0)
+
+            print(f'Epoch {epoch} [{i + 1}/{num_batches}] | loss: {loss.item():.4f}, batch/s: {bps_cum:0.f}({bps_cur:0.f}), img/s: {ips_cum:0.f}({ips_cur:0.f}), ETA: {eta:.1f} min')
+
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/rps": ips_cum,
+                "train/epoch": epoch
+            })
+
+def evaluate(action_head, device, dinowm, loader, goals, epoch):
+    action_head.eval()
+    val_loss = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            for k, v in batch.items():
+                if torch.is_tensor(v):
+                    batch[k] = v.to(device, non_blocking=True)
+            
+            attach_goals(batch, goals)
+            
+            z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
+            z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
+            action = batch['action'][:,-1,:2]
+
+            pred = action_head(z)
+            loss = F.mse_loss(pred, action)
+
+            batch_size = batch['action'].shape[0]
+            val_loss += loss.item() * batch_size
+            total += batch_size
+
+    rmse = math.sqrt(val_loss / total)
+    print(f'Epoch {epoch} | Val RMSE: {rmse:.6f}')
+    wandb.log({"val/rmse": rmse, "epoch": epoch})
+    return rmse
+
 
 # ============================================================================
 # Main Entry Point
@@ -260,7 +344,6 @@ def to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp):
 
 def run():
     '''Trains action head from input datasets'''
-    # find device
     if torch.cuda.is_available():
         device = torch.device("cuda")
         torch.set_float32_matmul_precision('high')
@@ -269,13 +352,6 @@ def run():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-
-    def sync():
-        if device.type=='cuda':
-            torch.cuda.synchronize()
-        if device.type=='mps':
-            torch.mps.synchronize()
-
     print("device:", device)
 
     # load datasets
@@ -328,73 +404,39 @@ def run():
         fused=True  # optimization
     )
 
-    def report_stats():
-        sync()
-        elapsed = time.perf_counter() - t0
-        sps = i / max(1e-9, elapsed)
-        bps = n / max(1e-9, elapsed)
-        eta = (num_batches - i) / max(1e-9, sps)
-        print(
-            f"Epoch {epoch}: step {i}/{len(train_loader)} "
-            f"Loss = {loss.item():.4f} "
-            f"steps / sec = {sps:.1f}, batches / sec = {bps:.1f} "
-            f"ETA = {eta / 60.0:.1f} min"
-        )
+    # logging
+    wandb.init(project="pusht-actionhead", config={
+        "batch_size": BATCH_SIZE,
+        "lr": LEARNING_RATE,
+        "epochs": EPOCHS,
+        "weight_decay": WEIGHT_DECAY,
+        "num_steps": NUM_STEPS
+    })
+    wandb.watch(action_head, log_freq=100)
+
+    # checkpoint dir
+    out_dir = Path(OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # share memory for workers
     # train_goals["pixels"] = train_goals["pixels"].share_memory_()
     # train_goals["proprio"] = train_goals["proprio"].share_memory_()
 
-    num_batches = len(train_loader)
     for epoch in range(1, EPOCHS + 1):
-        action_head.train()
-        t0 = time.perf_counter()
-        n = 0
-
-        # TRAIN LOOP
-        for i, batch in enumerate(train_loader):
-            attach_goals(batch, train_goals, NUM_STEPS)
-            # move CPU -> GPU
-            for k, v in batch.items():
-                if torch.is_tensor(v):
-                    batch[k] = v.to(device, non_blocking=True)
-
-            z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
-            z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
-            action = batch['action'][:,-1,:2] # first action from the last (current) step
-
-            pred = action_head(z)
-
-            loss = F.mse_loss(pred, action)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-            n += BATCH_SIZE # partial batches this breaks but whatever
-            if i % 50 == 0:
-                report_stats()
+        # train + evaluate
+        train_epoch(action_head, device, dinowm, train_loader, train_goals, optimizer, epoch)
+        rmse = evaluate(action_head, device, dinowm, val_loader, val_goals, epoch)
         
-        # VALIDATION LOOP
-        action_head.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                attach_goals(batch, val_goals, NUM_STEPS)
-                for k, v in batch.items():
-                    if torch.is_tensor(v):
-                        batch[k] = v.to(device, non_blocking=True)
-                
-                z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
-                z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
-                action = batch['action'][:,-1,:2]
-
-                pred = action_head(z)
-                loss = F.mse_loss(pred, action)
-                batch_size = batch['action'].shape[0]
-                val_loss += loss.item() * batch_size
-
-        val_rmse = math.sqrt(val_loss / len(val_data))
-        print(f'epoch {epoch}: RMSE: {val_rmse:.6f}')
+        checkpoint_path = out_dir / f"epoch_{epoch}.pt"
+        torch.save({
+            'epoch': epoch,
+            'model_state': action_head.state_dict(),
+            'val_rmse': rmse
+        }, checkpoint_path)
+        print(f"Saved to {checkpoint_path}")
+    
+    wandb.finish()
+    
 
 if __name__ == "__main__":
     run()
