@@ -42,7 +42,7 @@ PREFETCH_FACTOR = 2 # lower if low VRAM
 
 # TRAINING PARAMS:
 EPOCHS = 25
-LEARNING_RATE = 3e-4    # 5e-4, 3e-5
+LEARNING_RATE = 5e-4    # 5e-4, 3e-5
 WEIGHT_DECAY = 1e-4     # 1e-5
 USE_ACTIONS = True
 
@@ -141,7 +141,7 @@ def cache_goals(steps: StepsDataset):
     # pre-alloc tensors to store all goal pixels + proprio
     # assumes episodes are 1-indexed consecutively i..e 1,2,...n
     goal_pixels_tensor = torch.zeros((num_eps + 1, 3, 224, 224), dtype=torch.float32)
-    goal_proprio_tensor = torch.zeros((num_eps + 1, 10), dtype=torch.float32)
+    goal_proprio_tensor = torch.zeros((num_eps + 1, 4), dtype=torch.float32)
 
     transform = make_transform(['goal_pixels'])
     for ep, indices in steps.episode_slices.items():
@@ -274,9 +274,15 @@ def train_epoch(action_head, device, dinowm, loader, goals, optimizer, epoch):
         
         # attach goals
         attach_goals(batch, goals)
+        start_event = torch.cuda.Event(enable_timing=True)
+        encode_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
         # encode to feature
+        start_event.record()
         z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
+
+        encode_event.record()
         z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
         action = batch['action'][:,-1,:2] # first action from the last (current) step
 
@@ -287,12 +293,18 @@ def train_epoch(action_head, device, dinowm, loader, goals, optimizer, epoch):
         loss.backward()
         optimizer.step()
 
+        end_event.record()
+
+        if device.type == "cuda": torch.cuda.synchronize()
+        dino_time = start_event.elapsed_time(encode_event)
+        mlp_time = encode_event.elapsed_time(end_event)
+
         # logging
-        if i % 50 == 0:
+        if (i + 1) % 50 == 0:
             if device.type == "cuda": torch.cuda.synchronize()
             t = time.perf_counter()
 
-            bps_cum = 50 * (i + 1) / (t - t0)
+            bps_cum = (i + 1) / (t - t0)
             bps_cur = 50 / (t - t_prev)
             ips_cum = bps_cum * BATCH_SIZE
             ips_cur = bps_cur * BATCH_SIZE
@@ -300,7 +312,8 @@ def train_epoch(action_head, device, dinowm, loader, goals, optimizer, epoch):
             
             eta = (num_batches - (i + 1)) / (bps_cum * 60.0)
 
-            print(f'Epoch {epoch} [{i + 1}/{num_batches}] | loss: {loss.item():.4f}, batch/s: {bps_cum:0.f}({bps_cur:0.f}), img/s: {ips_cum:0.f}({ips_cur:0.f}), ETA: {eta:.1f} min')
+            print(f'Epoch {epoch} [{i + 1}/{num_batches}] | loss: {loss.item():.4f}, batch/s: {bps_cum:.1f}({bps_cur:.1f}), img/s: {ips_cum:.1f}({ips_cur:.1f}), ETA: {eta:.1f} min')
+            print(f"Time Breakdown: DINO={dino_time:.1f}ms, MLP={mlp_time:.1f}ms")
 
             wandb.log({
                 "train/loss": loss.item(),
@@ -320,7 +333,6 @@ def evaluate(action_head, device, dinowm, loader, goals, epoch):
                     batch[k] = v.to(device, non_blocking=True)
             
             attach_goals(batch, goals)
-            
             z_pix, z_prp, z_act, z_gpix, z_gprp = encode(batch, dinowm, device)
             z = to_feature(z_pix, z_prp, z_act, z_gpix, z_gprp)
             action = batch['action'][:,-1,:2]
