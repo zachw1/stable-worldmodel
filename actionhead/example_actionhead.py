@@ -195,7 +195,7 @@ def load_checkpoint(checkpoint_name, device):
     del dinowm.decoder
     torch.cuda.empty_cache()
 
-    print(f"Loaded DINO-WM from checkpoint: '{CHECKPOINT_NAME}'")
+    print(f"Loaded DINO-WM from checkpoint: '{checkpoint_name}'")
     return dinowm
 
 @torch.inference_mode()

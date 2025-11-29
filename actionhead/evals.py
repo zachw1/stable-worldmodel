@@ -89,15 +89,14 @@ class Actor(nn.Module):
     @torch.inference_mode()
     def encode(self, pixels, proprios, actions, goal_pixel, goal_proprio):
         '''Encode to latents via DINO-WM'''
-        # TODO:
-        #   - makes assumptions about dims, might break at inference-time?
+        # CHANGED: expects action_dim = B x (T-1) x action_dim*frameskip?
 
         pix_in = torch.cat((pixels, goal_pixel), dim=1)
         prp_in = torch.cat((proprios, goal_proprio), dim=1)
         act_in = (
-            torch.cat((actions, torch.zeros_like(actions[:, :1])), dim=1,) if self.use_actions else None
+            torch.cat((actions, torch.zeros_like(actions[:, :1]), torch.zeros_like(actions[:, :1])), dim=1,) if self.use_actions else None
         ) # pad with a single step of 0s
-        print(act_in.shape, pix_in.shape, prp_in.shape)
+        # TODO: fix this hacky pad
 
         data = {
             "pixels": pix_in,
@@ -155,16 +154,24 @@ class Actor(nn.Module):
         return self.head(z)
 
 class AmortizedMPCPolicy(BasePolicy):   # ExpertPolicy? not WorldModelPolicy right
+    """
+    Policy
+    """
     def __init__(self,
                  actor: Actor,
                  transform,
                  num_steps=NUM_STEPS,
+                 frameskip=FRAMESKIP,
                  device='cuda'
                  ):
         super().__init__()
         self.actor = actor
         self.transform = transform
+
         self.num_steps = num_steps
+        self.frameskip = frameskip
+        self.buffer_len = (num_steps - 1) * frameskip + 1 # because we need to simulate striding
+        # this might only need to be (num_steps - 1) * frameskip + 1
 
         self.n_envs = 0
         self.act_hist = None
@@ -175,16 +182,18 @@ class AmortizedMPCPolicy(BasePolicy):   # ExpertPolicy? not WorldModelPolicy rig
     def set_env(self, env):
         self.env = env
         self.n_envs = getattr(env, "num_envs", 1)
-        self.act_hist = [deque(maxlen=self.num_steps - 1) for _ in range(self.n_envs)]
-        self.pix_hist = [deque(maxlen=self.num_steps) for _ in range(self.n_envs)]
-        self.prp_hist = [deque(maxlen=self.num_steps) for _ in range(self.n_envs)]
+        self.act_hist = [deque(maxlen=self.buffer_len) for _ in range(self.n_envs)]
+        self.pix_hist = [deque(maxlen=self.buffer_len) for _ in range(self.n_envs)]
+        self.prp_hist = [deque(maxlen=self.buffer_len) for _ in range(self.n_envs)]
     
     def reset_hist(self, env_idx, pixels, proprio):
-        null_act = torch.zeros(ACTION_DIM * FRAMESKIP, device=self.device, dtype=torch.float32)
-        self.act_hist[env_idx] = deque([null_act for _ in range(self.num_steps - 1)])
-        self.pix_hist[env_idx] = deque([pixels for _ in range(self.num_steps)])
-        self.prp_hist[env_idx] = deque([proprio for _ in range(self.num_steps)])
+        # placeholder action
+        zero_action = torch.zeros(ACTION_DIM, device=self.device, dtype=torch.float32)
+        self.act_hist[env_idx] = deque([zero_action for _ in range(self.buffer_len)])
+        self.pix_hist[env_idx] = deque([pixels for _ in range(self.buffer_len)])
+        self.prp_hist[env_idx] = deque([proprio for _ in range(self.buffer_len)])
 
+    @torch.no_grad()
     def get_action(self, obs, **kwargs):
         steps = obs['step_idx']
         batch = {
@@ -201,21 +210,36 @@ class AmortizedMPCPolicy(BasePolicy):   # ExpertPolicy? not WorldModelPolicy rig
             proprio = obs['proprio'][i]
             goal_proprios = obs['goal_proprio'][i]
 
+            # transform and to GPU
             transforms = self.transform({'pixels': pixels, 'goal': goal_pixels})
             pixels = transforms['pixels'].to(self.device)
             goal_pixels = transforms['goal'].to(self.device)
             proprio = torch.from_numpy(proprio).float().to(self.device)
             goal_proprios = torch.from_numpy(goal_proprios).float().to(self.device)
 
+            # reset history if first step
             if steps[i] == 0:
                 self.reset_hist(i, pixels, proprio)
             else:
                 self.pix_hist[i].append(pixels)
                 self.prp_hist[i].append(proprio)
             
-            batch['pixels'].append(torch.stack(list(self.pix_hist[i])))
-            batch['proprios'].append(torch.stack(list(self.prp_hist[i])))
-            batch['actions'].append(torch.stack(list(self.act_hist[i])))
+            all_pixels = list(self.pix_hist[i])
+            all_proprios = list(self.prp_hist[i])
+            all_actions = list(self.act_hist[i])
+
+            indices = list(range(0, self.buffer_len, self.frameskip))
+            pixel_hist = torch.stack([all_pixels[i] for i in indices])
+            proprio_hist = torch.stack([all_proprios[i] for i in indices])
+            action_hist = torch.stack([torch.cat(all_actions[i:i+self.frameskip], dim=0) for i in indices[:-1]])
+
+            # pad for encode
+            # zero_block = torch.zeros(ACTION_DIM * self.frameskip, device=self.device, dtype=torch.float32)
+            # action_hist = torch.cat((action_hist, zero_block), dim=0)
+
+            batch['pixels'].append(pixel_hist)
+            batch['proprios'].append(proprio_hist)
+            batch['actions'].append(action_hist)
             batch['goal_pixels'].append(goal_pixels)
             batch['goal_proprios'].append(goal_proprios)
         
@@ -311,9 +335,5 @@ if __name__ == '__main__':
     amortized_mpc = AmortizedMPCPolicy(actor=actor, transform=make_transform(["pixels", "goal"]), num_steps=NUM_STEPS, device=device)
 
     world.set_policy(amortized_mpc)
-    world.evaluate(episodes=NUM_EPISODES, seed=42)
-    print(world.infos.keys())
-    print(world.infos['pixels'].shape)
-    print(world.infos['goal'].shape)
-    print(world.infos['proprio'].shape)
-    print(world.infos['goal_proprio'].shape)
+    results = world.evaluate(episodes=NUM_EPISODES, seed=42)
+    print(results)
